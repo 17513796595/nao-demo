@@ -1,0 +1,363 @@
+# -*- coding: utf-8 -*-
+import time
+import naoqi
+from naoqi import ALProxy
+import threading
+import Queue
+import socket
+import struct
+import re
+
+import config
+
+class AudioRecorder:
+    def __init__(self, nao_ip=config.NAO_IP, nao_port=config.NAO_PORT, server_ip=config.SERVER_IP, server_port=config.SERVER_PORT):
+        # 初始化NAO连接
+        self.NAO_IP = nao_ip
+        self.NAO_PORT = nao_port
+        
+        # 服务器配置
+        self.SERVER_IP = server_ip
+        self.SERVER_PORT = server_port
+        
+        # 录音参数
+        self.ENERGY_THRESHOLD = 17000  # 能量阈值，检测声音的灵敏度
+        self.record_path = "/home/nao/naoqi/audio.wav"
+        
+        # 日志控制变量
+        self.last_energy_log_time = 0  # 上次记录低能量的时间
+        self.last_speech_log_time = 0  # 上次记录检测到声音的时间
+        self.log_interval = 2.0  # 日志记录间隔（秒）
+        
+        # 初始化录音设备
+        try:
+            self.audio_device = ALProxy("ALAudioDevice", nao_ip, nao_port)
+            self.audio_recorder = ALProxy("ALAudioRecorder", nao_ip, nao_port)
+            self.tts = ALProxy("ALTextToSpeech", nao_ip, nao_port)
+            self.aup = ALProxy("ALAudioPlayer", nao_ip, nao_port)
+            print("音频设备初始化成功")
+        except Exception as e:
+            print("初始化音频设备失败: " + str(e))
+            return
+            
+        # 文本播放队列
+        self.text_queue = Queue.Queue()
+        
+        # 创建应答接收socket
+        self.response_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.response_socket.bind(("0.0.0.0", server_port))
+        
+        # 设置接收缓冲区大小
+        self.response_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        
+        # 启动接收响应的线程
+        self.receiver_thread = threading.Thread(target=self.receive_response)
+        self.receiver_thread.daemon = True
+        self.receiver_thread.start()
+        
+        # 启动TTS播放线程
+        self.tts_thread = threading.Thread(target=self.process_tts_queue)
+        self.tts_thread.daemon = True
+        self.tts_thread.start()
+        
+        # TTS状态标志
+        self.is_tts_playing = False
+        
+        # 添加外部TTS播放状态 - 用于检查阿里云TTS是否在播放
+        self.external_tts_playing = False
+        
+        # 录音状态
+        self.is_recording = False
+        
+        print("音频录制器初始化成功")
+    
+    def is_tts_busy(self):
+        """检查TTS是否正在播放"""
+        try:
+            return self.tts.isSpeaking()
+        except:
+            return False
+            
+    def register_external_tts(self, aliyun_player):
+        """注册外部TTS播放器，用于协调录音和播放"""
+        try:
+            self.aliyun_player = aliyun_player
+            
+            # 使用定时轮询方式监控播放状态
+            def monitor_playing_state():
+                while True:
+                    try:
+                        # 直接访问属性
+                        old_state = self.external_tts_playing
+                        self.external_tts_playing = aliyun_player.is_playing
+                        
+                        # 只在状态变化时记录日志
+                        if old_state != self.external_tts_playing:
+                            print("AliyunTTS播放状态更新: %s -> %s" % (old_state, self.external_tts_playing))
+                    except:
+                        pass
+                    time.sleep(0.5)  # 每0.5秒检查一次
+            
+            # 启动监控线程
+            self.monitor_thread = threading.Thread(target=monitor_playing_state)
+            self.monitor_thread.daemon = True
+            self.monitor_thread.start()
+            
+            print("成功注册外部TTS播放器")
+        except Exception as e:
+            print("注册外部TTS播放器失败: " + str(e))
+    
+    def should_pause_recording(self):
+        """判断是否应该暂停录音"""
+        return self.is_tts_playing or self.external_tts_playing or self.is_tts_busy()
+        
+    def process_tts_queue(self):
+        """处理TTS播放队列"""
+        while True:
+            try:
+                # 从队列获取文本
+                text = self.text_queue.get()
+                if text:
+                    # 确保text是NAO TTS需要的格式
+                    if isinstance(text, unicode):
+                        text = text.encode('utf-8')  # 转换unicode为utf-8字符串
+                    
+                    # 处理标点符号（为了避免TTS读出标点符号）
+                    # 中文常见标点符号和英文标点符号
+                    self.is_tts_playing = True
+                    self.tts.say(text)
+                    # 等待TTS播放完成
+                    while self.is_tts_busy():
+                        time.sleep(0.1)
+                    self.is_tts_playing = False
+            except Exception as e:
+                print("TTS播放错误: " + str(e))
+                time.sleep(0.1)
+    
+    
+    def receive_response(self):
+        """接收并播放PC返回的文本响应"""
+        print("等待接收文本响应...")
+        while True:
+            try:
+                data, addr = self.response_socket.recvfrom(65536)
+                if not data:
+                    continue
+                    
+                # 为了避免处理二进制数据，我们完全禁用文本处理
+                # 此方法仍然保留，但不再处理任何接收到的数据
+                print("收到数据，但已禁用文本处理")
+                    
+            except Exception as e:
+                print("接收响应错误: " + str(e))
+                time.sleep(1)
+    def send_to_server(self, file_path):
+        try:
+            time.sleep(0.1)
+            file_path = "/home/nao/naoqi/audio.wav"
+
+            try:
+                with open(file_path, "rb") as f:
+                    audio_data = f.read()
+                    print("成功读取")
+            except Exception as e:
+                print("读取文件失败:" + str(e))
+                return
+                
+            # 创建UDP socket发送文件
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # 设置发送缓冲区大小
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+                
+                # 分片大小（1400字节，留出一些空间给UDP头部）
+                chunk_size = 1400
+                total_chunks = (len(audio_data) + chunk_size - 1) // chunk_size
+                
+                # 发送文件头信息
+                header = struct.pack('!I', total_chunks)
+                s.sendto(header, (self.SERVER_IP, self.SERVER_PORT))
+                
+                # 分片发送数据
+                for i in range(total_chunks):
+                    start = i * chunk_size
+                    end = min(start + chunk_size, len(audio_data))
+                    chunk = audio_data[start:end]
+                    
+                    # 添加分片头部信息
+                    chunk_header = struct.pack('!I', i)
+                    chunk_with_header = chunk_header + chunk
+                    
+                    s.sendto(chunk_with_header, (self.SERVER_IP, self.SERVER_PORT))
+                    time.sleep(0.001)  # 添加小延迟，避免发送过快
+                
+                print("文件发送成功")
+            finally:
+                s.close()
+        except Exception as e:
+            print("发送文件错误: " + str(e))
+        
+    def get_average_energy(self):
+        """获取多次采样的平均能量，以减少噪声影响"""
+        energies = []
+        for _ in range(3):  # 采样3次
+            try:
+                energy = self.audio_device.getFrontMicEnergy()
+                energies.append(energy * 100)
+                time.sleep(0.01)
+            except Exception as e:
+                print("获取能量错误: " + str(e))
+                return 0
+        return sum(energies) / len(energies) if energies else 0
+        
+    def recorder(self):
+        while True:  # 外层循环，持续监听
+            try:
+                # 如果TTS正在播放或外部TTS正在播放，暂停录音
+                if self.should_pause_recording():
+                    if self.is_recording:
+                        print("TTS正在播放，暂停录音")
+                        try:
+                            self.audio_recorder.stopMicrophonesRecording()
+                            self.is_recording = False
+                        except:
+                            pass
+                    time.sleep(0.1)
+                    continue
+                
+                # 初始停止录音
+                if self.is_recording:
+                    try:
+                        self.audio_recorder.stopMicrophonesRecording()
+                        self.is_recording = False
+                    except:
+                        pass
+                
+                time.sleep(0.2)
+                wait = 0
+                
+                # 开始录音
+                print("准备开始录音...")
+                try:
+                    self.audio_recorder.startMicrophonesRecording(
+                        self.record_path, "wav", 16000, (0, 0, 1, 0)
+                    )
+                    self.is_recording = True
+                    print("开始监听...")
+                except Exception as e:
+                    print("开始录音失败: " + str(e))
+                    time.sleep(1)
+                    continue
+                
+                # 记录录音开始时间
+                record_start_time = time.time()
+                # 内层循环，检测声音
+                while True:
+                    # 如果TTS开始播放，立即停止录音
+                    if self.should_pause_recording():
+                        print("TTS开始播放，停止录音")
+                        try:
+                            self.audio_recorder.stopMicrophonesRecording()
+                            self.is_recording = False
+                        except:
+                            pass
+                        break
+                        
+                    current_energy = self.get_average_energy()
+                    current_time = time.time()
+                    
+                    # 最大连续录音时长（秒）
+                    max_continuous_recording = 3.0
+                    
+                    # 如果检测到声音且录音时长超过阈值，分段发送
+                    if current_energy >= self.ENERGY_THRESHOLD:
+                        # 检测到声音后开始计时
+                        if not hasattr(self, 'speech_start_time'):
+                            self.speech_start_time = time.time()
+                        
+                        # 计算连续说话时长
+                        speech_duration = current_time - self.speech_start_time
+                        
+                        # 如果连续说话超过最大时长，分段保存发送
+                        if speech_duration >= max_continuous_recording:
+                            print("录音时长已达到%.1f秒，分段保存发送" % max_continuous_recording)
+                            try:
+                                # 停止当前录音
+                                self.audio_recorder.stopMicrophonesRecording()
+                                self.is_recording = False
+                                
+                                # 等待文件写入完成
+                                time.sleep(0.2)
+                                
+                                # 发送音频数据
+                                self.send_to_server(self.record_path)
+                                
+                                # 重新开始录音
+                                time.sleep(0.1)
+                                self.audio_recorder.startMicrophonesRecording(
+                                    self.record_path, "wav", 16000, (0, 0, 1, 0)
+                                )
+                                self.is_recording = True
+                                print("继续录音...")
+                                
+                                # 重置开始时间
+                                self.speech_start_time = time.time()
+                            except Exception as e:
+                                print("分段录音失败: " + str(e))
+                                self.is_recording = False
+                                break
+
+                    if current_energy < self.ENERGY_THRESHOLD:
+                        wait += 0.1
+                        
+                        # 使用时间间隔控制，避免频繁打印噪音值
+                        if current_time - self.last_energy_log_time >= self.log_interval:
+                            print("当前能量: %.2f < %d" % (current_energy, self.ENERGY_THRESHOLD))
+                            self.last_energy_log_time = current_time
+
+                        if wait >= 1 and self.is_recording:
+                            print("检测到语音结束，停止录音")
+                            self.audio_recorder.stopMicrophonesRecording()
+                            self.is_recording = False
+                            time.sleep(0.5)  # 增加等待时间，确保文件写入完成
+                            self.send_to_server(self.record_path)
+                            break
+                    else:
+                        wait = 0
+                        
+                        # 使用时间间隔控制，避免频繁打印声音能量值
+                        if current_time - self.last_speech_log_time >= self.log_interval:
+                            print("检测到声音！能量: %.2f" % current_energy)
+                            self.last_speech_log_time = current_time
+                
+                time.sleep(0.5)
+                
+            except KeyboardInterrupt:
+                print("\n程序停止")
+                try:
+                    self.audio_recorder.stopMicrophonesRecording()
+                    self.is_recording = False
+                except:
+                    pass
+                break
+                
+            except Exception as e:
+                print("录音错误: " + str(e))
+                time.sleep(1)
+                
+    def stop_recording(self):
+        """停止录音 - 用于程序退出时调用"""
+        try:
+            if self.is_recording:
+                self.audio_recorder.stopMicrophonesRecording()
+                self.is_recording = False
+        except:
+            pass
+    
+    def play_mp3(self, file_path):
+        """播放指定路径的MP3文件"""
+        try:
+            print("播放MP3文件: %s" % file_path)
+            self.aup.playFile(file_path)
+        except Exception as e:
+            print("播放MP3文件失败: " + str(e))

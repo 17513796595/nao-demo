@@ -1,0 +1,41 @@
+from funasr import AutoModel
+import numpy as np
+from queue import Queue
+import threading
+
+class ASRModel:
+    def __init__(self, model_path="/home/ye/.cache/modelscope/hub/models/iic/SenseVoiceSmall",
+                 model_revision="v2.0.4"):
+        self.model = AutoModel(
+            model=model_path,
+            model_revision=model_revision,
+            disable_update=True
+        )
+    
+    def generate(self, audio_data):
+        """生成语音识别结果"""
+        try:
+            # 检查音频数据是否有效
+            if audio_data is None or len(audio_data) == 0:
+                print("警告：ASR接收到无效音频数据")
+                return None
+                
+            # 确保音频长度足够
+            if len(audio_data) < 2:
+                print("警告：ASR音频数据长度不足")
+                return None
+                
+            text = self.model.generate(audio_data)
+            return text[0]['text']
+        except Exception as e:
+            print(f"ASR识别错误: {str(e)}")
+            return None
+
+def asr_worker(audio_data, result_queue, asr_model):
+    """ASR识别工作线程"""
+    try:
+        text = asr_model.generate(audio_data)
+        result_queue.put(('asr', text))
+    except Exception as e:
+        print(f"ASR识别错误: {str(e)}")
+        result_queue.put(('asr', None)) 
